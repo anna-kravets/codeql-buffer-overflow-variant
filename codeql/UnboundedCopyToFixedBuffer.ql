@@ -41,17 +41,23 @@ class CopyCall extends FunctionCall {
 }
 
 /**
- * Holds if `call` writes into the local array `dest`, whose size is a known
- * `destSize` bytes — i.e. a fixed-size stack buffer such as pppd's
- * `char rhostname[256]` (`eap.c:1319`).
+ * Holds if `v` is an array of a known size, `size` bytes — a fixed-size stack
+ * buffer such as pppd's `char rhostname[256]` (`eap.c:1319`).
+ *
+ * This is the one place `size` is computed from `dest`, so every predicate that
+ * mentions both can bind them here.
  */
+predicate fixedSizeArray(LocalVariable v, int size) {
+  size = v.getType().getUnspecifiedType().(ArrayType).getSize() and
+  size > 0
+}
+
+/** Holds if `call` writes into the fixed-size local array `dest` of `destSize` bytes. */
 predicate copiesIntoFixedBuffer(CopyCall call, LocalVariable dest, int destSize) {
-  exists(VariableAccess va, ArrayType at |
+  fixedSizeArray(dest, destSize) and
+  exists(VariableAccess va |
     va = call.getDestArg().getAChild*() and
-    dest = va.getTarget() and
-    at = dest.getType().getUnspecifiedType() and
-    destSize = at.getSize() and
-    destSize > 0
+    dest = va.getTarget()
   )
 }
 
@@ -63,20 +69,21 @@ predicate copiesIntoFixedBuffer(CopyCall call, LocalVariable dest, int destSize)
  * against `len + sizeof (rhostname)`, an addition, which therefore does not
  * qualify — the first of two reasons the dead check is not accepted as a guard.
  */
-predicate denotesDestSize(Expr e, Variable dest, int destSize) {
-  e.(SizeofExprOperator).getExprOperand().(VariableAccess).getTarget() = dest
-  or
-  e.(Literal).getValue().toInt() = destSize
+predicate denotesDestSize(Expr e, LocalVariable dest, int destSize) {
+  fixedSizeArray(dest, destSize) and
+  (
+    e.(SizeofExprOperator).getExprOperand().(VariableAccess).getTarget() = dest
+    or
+    e.(Literal).getValue().toInt() = destSize
+  )
 }
 
 /**
- * Holds if the length passed to `call` is a compile-time constant that already
- * fits in `dest`, e.g. the trimming branch's `BCOPY(..., sizeof (rhostname) - 1)`
- * at `eap.c:1425`. Such a copy is safe by construction.
+ * Holds if `call` copies a compile-time constant `n` bytes, e.g. the trimming
+ * branch's `BCOPY(..., sizeof (rhostname) - 1)` at `eap.c:1425`. Such a copy is
+ * safe by construction when `n` fits the destination.
  */
-predicate lengthIsSafeConstant(CopyCall call, int destSize) {
-  call.getLengthArg().getValue().toInt() <= destSize
-}
+predicate constantLength(CopyCall call, int n) { n = call.getLengthArg().getValue().toInt() }
 
 /**
  * Holds if some comparison in the enclosing function bounds *the copy length
@@ -90,7 +97,7 @@ predicate lengthIsSafeConstant(CopyCall call, int destSize) {
  * tree goes quiet. Same predicate, opposite verdicts: that is the negative
  * control for Phase 4.
  */
-predicate lengthCheckedAgainstDestSize(CopyCall call, Variable dest, int destSize) {
+predicate lengthCheckedAgainstDestSize(CopyCall call, LocalVariable dest, int destSize) {
   exists(ComparisonOperation cmp, Expr checked, Expr bound |
     cmp.getEnclosingFunction() = call.getEnclosingFunction() and
     checked = cmp.getAnOperand() and
@@ -104,7 +111,7 @@ predicate lengthCheckedAgainstDestSize(CopyCall call, Variable dest, int destSiz
 from CopyCall call, LocalVariable dest, int destSize
 where
   copiesIntoFixedBuffer(call, dest, destSize) and
-  not lengthIsSafeConstant(call, destSize) and
+  not exists(int n | constantLength(call, n) and n <= destSize) and
   not lengthCheckedAgainstDestSize(call, dest, destSize)
 select call,
   "Copy into fixed-size buffer '" + dest.getName() + "' (" + destSize.toString() +

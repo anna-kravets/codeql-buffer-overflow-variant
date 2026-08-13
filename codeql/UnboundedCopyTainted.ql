@@ -17,8 +17,10 @@
  */
 
 import cpp
-import semmle.code.cpp.ir.dataflow.new.DataFlow
-import semmle.code.cpp.ir.dataflow.new.TaintTracking
+// The `new` dataflow library lives under `semmle/code/cpp/dataflow/`, not under
+// `semmle/code/cpp/ir/dataflow/`. It forwards to the IR implementation.
+import semmle.code.cpp.dataflow.new.DataFlow
+import semmle.code.cpp.dataflow.new.TaintTracking
 import semmle.code.cpp.security.FlowSources
 import CopyToFixedBuffer
 

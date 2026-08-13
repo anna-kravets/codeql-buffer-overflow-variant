@@ -15,7 +15,7 @@
  */
 
 import cpp
-import semmle.code.cpp.ir.dataflow.new.DataFlow
+import semmle.code.cpp.dataflow.new.DataFlow
 import semmle.code.cpp.security.FlowSources
 import CopyToFixedBuffer
 

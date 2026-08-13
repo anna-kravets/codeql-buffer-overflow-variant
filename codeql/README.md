@@ -92,10 +92,16 @@ rest and vary by bundle version; the sink-only query is unaffected either way.
 
 | Error mentions | Try instead |
 | -------------- | ----------- |
-| `globalValueNumber` | import `semmle.code.cpp.valuenumbering.HashCons`, use `hashCons(...)` |
-| `DataFlow::ConfigSig` or `TaintTracking::Global` | pre-2023 bundle: replace the module with `class Cfg extends TaintTracking::Configuration` and `isSource` / `isSink` member predicates |
+| `could not resolve module ...dataflow...` | list what your bundle actually ships and read the module name off the path: `find ~/codeql ~/.codeql -path '*cpp*' \( -name 'DataFlow.qll' -o -name 'TaintTracking.qll' \) 2>/dev/null` — everything from `semmle/` onward, with `/` replaced by `.`, is the import |
+| `DataFlow::ConfigSig` or `TaintTracking::Global` | pre-2023 bundle: replace the module with `class Cfg extends TaintTracking::Configuration` and `isSource` / `isSink` member predicates, and use `Cfg.hasFlowPath(source, sink)` |
 | `asParameter(_)` | drop the argument: `source.asParameter() = handler.getAParameter()` — scalar parameters only, which is enough for the variant but **not** for pppd, whose length is re-read from the packet body |
 | `semmle.code.cpp.security.FlowSources` | drop the `RemoteFlowSource` disjunct entirely and rely on dispatch-table parameters; record this in the write-up as a limitation |
+| `globalValueNumber` | import `semmle.code.cpp.valuenumbering.HashCons`, use `hashCons(...)` |
+
+**Resolved so far on the VM's bundle:** `GlobalValueNumbering` / `globalValueNumber`,
+`ArrayType.getSize()` (returns bytes), `semmle.code.cpp.security.FlowSources`. The `new`
+dataflow library is at `semmle.code.cpp.dataflow.new.*`, **not** `semmle.code.cpp.ir.dataflow.new.*`
+— the `new` directory sits under `dataflow/`, not under `ir/dataflow/`.
 
 ## 3. Probe the sources first
 

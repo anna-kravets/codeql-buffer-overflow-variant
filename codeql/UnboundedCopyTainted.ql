@@ -19,9 +19,13 @@
 import cpp
 // The `new` dataflow library lives under `semmle/code/cpp/dataflow/`, not under
 // `semmle/code/cpp/ir/dataflow/`. It forwards to the IR implementation.
+//
+// `semmle.code.cpp.security.FlowSources` is deliberately *not* imported. In the bundle
+// on the VM it is built on a different dataflow library, so importing both makes the
+// name `DataFlow` ambiguous. `SourceProbe.ql` imports it in isolation instead, which is
+// where the question it answers belongs anyway.
 import semmle.code.cpp.dataflow.new.DataFlow
 import semmle.code.cpp.dataflow.new.TaintTracking
-import semmle.code.cpp.security.FlowSources
 import CopyToFixedBuffer
 
 /**
@@ -36,24 +40,29 @@ import CopyToFixedBuffer
  */
 module UnboundedCopyConfig implements DataFlow::ConfigSig {
   /**
-   * Two kinds of source.
+   * The parameters of any function whose address is stored in a function-pointer
+   * table.
    *
-   * `RemoteFlowSource` is the C/C++ pack's own model of network input. It is the
-   * right answer when it fires.
+   * This is what makes the query work on both targets. Neither program calls the
+   * vulnerable handler by name — pppd dispatches through `protent.input`, the variant
+   * through `ops[i].handle` — so if the pack's inter-procedural model does not resolve
+   * the indirect call, taint from the real `read()` never arrives at the sink and the
+   * query finds nothing. Treating a handler's own parameters as tainted picks taint up
+   * on the far side of that edge, and `dispatchTableTarget()` names neither table, so
+   * the same rule covers both call chains.
    *
-   * Parameters of dispatch-table handlers are the second kind, and they are what
-   * makes this query work on both targets. Neither pppd nor the variant calls the
-   * vulnerable handler by name — pppd goes through `protent.input`, the variant
-   * through `ops[i].handle` — so if the pack's inter-procedural model does not
-   * resolve the indirect call, taint from the real `read()` never arrives. Treating
-   * a handler's own parameters as tainted starts tracking on the far side of that
-   * edge. It is an over-approximation, and the write-up should say so: it assumes a
-   * function reachable only through a function-pointer table is reachable with
-   * attacker-supplied arguments. For a protocol dispatcher that is precisely true.
+   * Two honest caveats for the write-up.
+   *
+   * It is an over-approximation: it assumes a function reachable only through a
+   * function-pointer table is reachable with attacker-supplied arguments. For a
+   * protocol dispatcher that is precisely true; in general it is not.
+   *
+   * It is also the *only* source here. `RemoteFlowSource`, the pack's own model of
+   * network input, would be the better starting point, but it cannot be imported
+   * alongside this dataflow library in the bundle on the VM — see the import comment.
+   * Run `SourceProbe.ql` to see what it would have contributed.
    */
   predicate isSource(DataFlow::Node source) {
-    source instanceof RemoteFlowSource
-    or
     exists(Function handler |
       handler = dispatchTableTarget() and
       source.asParameter(_) = handler.getAParameter()

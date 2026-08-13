@@ -42,9 +42,12 @@ guard → still reported. The patch changes the comparison to `len - vallen >= s
 (rhostname)`, which **is** the copy length → guard recognised → patched tree goes quiet.
 One predicate, both verdicts.
 
-`UnboundedCopyTainted.ql` adds a fourth condition: taint must reach the length operand
-from either a `RemoteFlowSource` or a dispatch-table handler's parameter. See
-[`query-explained.md`](query-explained.md) for why the second source kind is needed.
+`UnboundedCopyTainted.ql` adds a fourth condition: taint must reach the length operand from
+the parameters of a dispatch-table handler. `RemoteFlowSource` would be the better source
+and is not used — in this bundle it cannot be imported alongside `dataflow.new` without
+making the name `DataFlow` ambiguous. `SourceProbe.ql` reports what it would have
+contributed. See [`query-explained.md`](query-explained.md) for why dispatch-table
+parameters are the source that actually matters here.
 
 ## Prerequisites
 
@@ -95,7 +98,7 @@ rest and vary by bundle version; the sink-only query is unaffected either way.
 | `could not resolve module ...dataflow...` | list what your bundle actually ships and read the module name off the path: `find ~/codeql ~/.codeql -path '*cpp*' \( -name 'DataFlow.qll' -o -name 'TaintTracking.qll' \) 2>/dev/null` — everything from `semmle/` onward, with `/` replaced by `.`, is the import |
 | `DataFlow::ConfigSig` or `TaintTracking::Global` | pre-2023 bundle: replace the module with `class Cfg extends TaintTracking::Configuration` and `isSource` / `isSink` member predicates, and use `Cfg.hasFlowPath(source, sink)` |
 | `asParameter(_)` | drop the argument: `source.asParameter() = handler.getAParameter()` — scalar parameters only, which is enough for the variant but **not** for pppd, whose length is re-read from the packet body |
-| `semmle.code.cpp.security.FlowSources` | drop the `RemoteFlowSource` disjunct entirely and rely on dispatch-table parameters; record this in the write-up as a limitation |
+| `module DataFlow is ambiguous` | two imports supply different modules of the same name. **Already hit and resolved**: `FlowSources` is no longer imported by the taint query, only by `SourceProbe.ql`, which needs no other dataflow library |
 | `globalValueNumber` | import `semmle.code.cpp.valuenumbering.HashCons`, use `hashCons(...)` |
 
 **Resolved so far on the VM's bundle:** `GlobalValueNumbering` / `globalValueNumber`,

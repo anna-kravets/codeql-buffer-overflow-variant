@@ -83,13 +83,16 @@ already failed conditions 1–3. Restricting the sink set inside the configurati
 in the `where` clause keeps the flow computation small, which matters on the VM's 1.3 GB
 evaluator heap.
 
-### Two kinds of source, and why the second exists
+### The source, and why it is not the obvious one
 
-**`RemoteFlowSource`** is the C/C++ pack's own model of network input. It is the right answer
-whenever it fires.
+**`RemoteFlowSource`** — the C/C++ pack's own model of network input — would be the right
+place to start, and the query does not use it. In the bundle on the VM it is built on a
+different dataflow library than `semmle.code.cpp.dataflow.new`, and importing both makes the
+name `DataFlow` ambiguous. `SourceProbe.ql` imports it in isolation and reports what it would
+have contributed, so the cost is measured rather than assumed.
 
-**Dispatch-table handler parameters** are the fallback, and they are what make the query work
-on both targets. Neither program calls the vulnerable handler by name:
+**Dispatch-table handler parameters** are therefore the only source — and they are the one
+that actually matters here, because neither program calls the vulnerable handler by name:
 
 ```c
 /* pppd — main.c dispatches through this table */
@@ -110,13 +113,21 @@ It names neither table, so it generalises to any dispatch-table design. That mat
 grading: the assignment asks for a query that survives a *different structure and call chain*,
 and these two tables have different shapes, different depths and different struct layouts.
 
-Be honest about the cost. This is an **over-approximation**: it assumes any function reachable
-only through a function-pointer table is reachable with attacker-supplied arguments. For a
-protocol dispatcher that is exactly true. In general it is not, and the write-up should say so
-rather than hide it.
+Be honest about the cost, twice over.
 
-`SourceProbe.ql` exists to tell these two source kinds apart before running the real query —
-so an empty result is diagnosable instead of mysterious.
+This is an **over-approximation**: it assumes any function reachable only through a
+function-pointer table is reachable with attacker-supplied arguments. For a protocol
+dispatcher that is exactly true. In general it is not, and the write-up should say so rather
+than hide it.
+
+And it is the *only* source, so taint starts inside the handler rather than at the `read()`.
+The query therefore demonstrates that the length is handler-derived, not that it is
+provably network-derived — the `read()` → dispatcher edge is argued in the write-up (§5) and
+not re-proved by the query. That is a real limitation, and naming it is better than being
+asked about it.
+
+`SourceProbe.ql` exists to measure both of those before running the real query — so an empty
+result is diagnosable instead of mysterious.
 
 ## How each site lands
 

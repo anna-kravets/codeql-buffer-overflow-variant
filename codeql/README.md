@@ -6,8 +6,8 @@ Queries for **CVE-2020-8597**, the pppd EAP `rhostname` stack buffer overflow.
 | ---- | ---------- |
 | `CopyToFixedBuffer.qll` | Shared library: the sink shape and the guard test. Both queries import it, so the only difference between their results is taint. |
 | `UnboundedCopyToFixedBuffer.ql` | **Phase 2 step 1** — sink shape only, no taint. Verified on all three databases. |
-| `UnboundedCopyTainted.ql` | **Phase 2 steps 2–4** — same sink, plus the length must be attacker-derived. Not yet verified. |
-| `SourceProbe.ql` | Diagnostic. Run it before the taint query. |
+| `UnboundedCopyTainted.ql` | **Phase 2 steps 2–4** — same sink, plus the length must be attacker-derived. Verified: 2 / 0 / 1. |
+| `SourceProbe.ql` | Diagnostic. Run it if the taint query returns nothing. |
 
 For what the queries decide and why, see [`query-explained.md`](query-explained.md).
 
@@ -169,23 +169,35 @@ specifically for a clamp (`if (n > N) n = N;`) — a clamp against a constant th
 literally the destination size is a genuine precision gap in condition 3, not a source-scope
 issue.
 
-### `UnboundedCopyTainted.ql` — prediction, not yet measured
+### `UnboundedCopyTainted.ql` — measured
 
-Recorded before running, so the write-up can show a falsifiable claim rather than a demo:
+Prediction was recorded before the run: 2 / 0 / 1. **It held exactly.**
 
-| Database | Predicted | Meaning if it holds |
-| -------- | --------- | ------------------- |
-| `ppp-vuln` | **2** — `eap.c:1428`, `eap.c:1854` | taint crosses the `protent.input` table and both non-CVE hits are source-scope, not precision, problems |
-| `ppp-fixed` | **0** | the guard test still works under taint |
-| variant | **1** — `tlv_server.c:78` | taint crosses `ops[i].handle` too |
+| Database | Findings | Paths | Detail |
+| -------- | -------- | ----- | ------ |
+| `ppp-vuln` | **2** | 4 | `eap.c:1428` and `eap.c:1854`. `chat.c` and `sendserver.c` are gone — they were unguarded copies of local data, never attacker-reachable. Precision 2/2. |
+| `ppp-fixed` | **0** | 0 | empty `#select`, empty edges and nodes. Nothing at all. |
+| variant | **1** | 2 | `tlv_server.c:78`, unchanged. |
 
-**Run the variant first** — seconds instead of half a minute, same question. If it returns
-0, taint is not crossing the function-pointer table and there is no point spending a pppd
-run; fix that first with `SourceProbe.ql`.
+Evaluation 38.9 s / 45.6 s / 8.8 s.
 
-The failure mode to watch for is 0 / 0 / 0. That does not mean the code is safe; it means
-taint never reached the sink, and the query is silently useless. Any result must be read
-against the sink-only numbers above.
+**Taint crossed the function-pointer table in both programs.** `eap_request` is reachable
+only via `protent.input` → `eap_input`, `handle_hello` only via `ops[i].handle`, and taint
+arrived at both. That was the largest open risk in the Part 3 plan, and it is now closed.
+
+**Findings vs paths.** Each finding is listed twice, with `inp` and `*inp` as sources on
+pppd, `payload` and `*payload` on the variant. Not a duplicate bug: `asParameter(_)` matches
+the parameter at every indirection level, so taint arrives both as the pointer and through
+its pointee. Two real paths to one sink, and `path-problem` prints one row per path. Report
+counts as "2 findings, 4 paths".
+
+**The path itself is worth showing.** On pppd the `nodes` table is 39 entries and reads
+`inp` → `*inp` → `... ++` → `... = ...` → `... -= ...` → `len` → `... - ...`: the pointer
+walks forward, the length is reassigned and decremented, and the last node is the copy
+length. That is the write-up's §5 argument produced mechanically, and it is why plain data
+flow would fail — the original value never survives, only its influence. The variant's path
+is 4 nodes: `payload` → the byte-combining expression → `vlen`. Same query, same bug class,
+chains differing by a factor of forty.
 
 ## Limitations and what remains
 

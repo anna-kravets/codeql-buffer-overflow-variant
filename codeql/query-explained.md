@@ -17,8 +17,8 @@ data flow, variant analysis) and `lectures/5. Buffer Overflow Attack.md`.
 neither redefines anything, so the only difference between their result sets is the taint
 condition. That is deliberate: the comparison is only evidence if nothing else changed.
 
-- `UnboundedCopyToFixedBuffer.ql` — conditions 1–3. Verified.
-- `UnboundedCopyTainted.ql` — conditions 1–4. Written, not yet verified.
+- `UnboundedCopyToFixedBuffer.ql` — conditions 1–3. Verified: 4 / 2 / 1.
+- `UnboundedCopyTainted.ql` — conditions 1–4. Verified: 2 / 0 / 1.
 
 ## Conditions 1–3: the sink
 
@@ -83,6 +83,13 @@ already failed conditions 1–3. Restricting the sink set inside the configurati
 in the `where` clause keeps the flow computation small, which matters on the VM's 1.3 GB
 evaluator heap.
 
+The path CodeQL produced on pppd is the argument made mechanically. Its 39 nodes read
+`inp` → `*inp` → `... ++` → `... = ...` → `... -= ...` → `len` → `... - ...`: the pointer
+walks forward through the packet, the length is reassigned and decremented, and the final
+node is the copy length. No single value survives from the parameter to the sink, which is
+exactly why data flow is not enough. The same query on the variant produces a 4-node path,
+`payload` → the byte-combining expression → `vlen` — forty times shorter, same verdict.
+
 ### The source, and why it is not the obvious one
 
 **`RemoteFlowSource`** — the C/C++ pack's own model of network input — would be the right
@@ -131,13 +138,13 @@ result is diagnosable instead of mysterious.
 
 ## How each site lands
 
-| Site | Check present? | Which half fails | Sink-only | Tainted (predicted) |
-| ---- | -------------- | ---------------- | --------- | ------------------- |
+| Site | Check present? | Which half fails | Sink-only | Tainted |
+| ---- | -------------- | ---------------- | --------- | ------- |
 | `eap.c:1428` `rhostname` (vuln) | yes, dead | both — wrong value **and** wrong bound | **hit** — the CVE | **hit** |
 | `eap.c:1854` `rhostname` (vuln) | yes, dead | both | **hit** — same bug, other path | **hit** |
 | `eap.c` `rhostname` (patched) | yes, live | neither | silent | silent |
-| `chat.c:1509` `temp` | no | — | hit | silent — `minlen` is from local config |
-| `sendserver.c:104` `passbuf` | unread | — | hit | silent — outgoing RADIUS packing |
+| `chat.c:1509` `temp` | no | — | hit | **silent** — length is from local config, not the network |
+| `sendserver.c:104` `passbuf` | not read | — | hit | **silent** — outgoing RADIUS packing |
 | `tlv_server.c:78` `name` | yes, `vlen > plen - 2` | bound only — `plen - 2` is the frame size, not `sizeof(name)` | **hit** | **hit** |
 | `tlv_server.c:104` `buf` | yes, `vlen >= sizeof(buf)` | neither | silent | silent |
 
@@ -145,8 +152,15 @@ Note the split in the two vulnerable sites: pppd fails on the **value-number** h
 `handle_hello` fails on the **bound** half. Two distinct ways to reach the same bug class, one
 predicate catching both — that is the variant analysis the assignment asks for.
 
-The last two columns are the experiment. The tainted predictions are recorded before the run,
-not after; if they do not hold, the reason is the finding.
+The last column was predicted before the run — 2 / 0 / 1 — and came out exactly that. Taint
+crossed both function-pointer tables, which was the largest open risk in the plan. The two
+non-CVE pppd rows went silent, so they were source-scope, not precision, problems: precision
+on the vulnerable tree is 2 of 2, and the patched tree returns nothing at all.
+
+Each finding appears as two rows, sourced from `inp` and `*inp` (pppd) or `payload` and
+`*payload` (variant). `asParameter(_)` matches the parameter at every indirection level, so
+taint arrives both as the pointer and through its pointee — two real paths, one sink. Count
+findings, not rows.
 
 ## What is still not modelled
 

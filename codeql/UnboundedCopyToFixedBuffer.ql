@@ -108,12 +108,33 @@ predicate lengthCheckedAgainstDestSize(CopyCall call, LocalVariable dest, int de
   )
 }
 
+/**
+ * A readable rendering of the copy length.
+ *
+ * `Expr.toString()` prints any binary operation as `... - ...`, which hides the
+ * whole point of this query — that pppd's length is `len - vallen` while its check
+ * constrains `vallen`. Spelling out the operands makes the finding self-explanatory
+ * in the terminal and on a slide.
+ */
+string describeLength(Expr e) {
+  exists(BinaryOperation b | b = e |
+    result =
+      b.getLeftOperand().toString() + " " + b.getOperator() + " " +
+        b.getRightOperand().toString()
+  )
+  or
+  not e instanceof BinaryOperation and result = e.toString()
+}
+
 from CopyCall call, LocalVariable dest, int destSize
 where
   copiesIntoFixedBuffer(call, dest, destSize) and
   not exists(int n | constantLength(call, n) and n <= destSize) and
   not lengthCheckedAgainstDestSize(call, dest, destSize)
 select call,
-  "Copy into fixed-size buffer '" + dest.getName() + "' (" + destSize.toString() +
-    " bytes) with length '" + call.getLengthArg().toString() +
+  call.getLocation().getFile().getBaseName() + ":" +
+    call.getLocation().getStartLine().toString() + " in " +
+    call.getEnclosingFunction().getName() + "() - copy into fixed-size buffer '" +
+    dest.getName() + "' (" + destSize.toString() + " bytes) with length '" +
+    describeLength(call.getLengthArg()) +
     "', which is never compared against the buffer's size."

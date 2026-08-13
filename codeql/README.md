@@ -5,6 +5,8 @@ query for **CVE-2020-8597** — the pppd EAP `rhostname` stack buffer overflow. 
 sink-centric: no taint tracking yet, no source modelling, no function-pointer bridging.
 Those are the next steps (see *Limitations* below).
 
+For what the query decides and why, see [`query-explained.md`](query-explained.md).
+
 > **Run everything below inside the course VM.** Building a CodeQL database means running
 > the target's real build (`make`), which is what the "VM only" rule is about. Query
 > execution itself never runs the analysed code — it only reads the database — but keeping
@@ -103,14 +105,23 @@ codeql database analyze $HOME/part3/ppp-vuln/db "$Q" \
 
 ## 4. Expected results
 
-| Database | Expected |
-| -------- | -------- |
-| `ppp-vuln` (2.4.8) | hit at `pppd/eap.c:1428` in `eap_request()` — **the CVE**; second hit at `pppd/eap.c:1854` in `eap_response()` — free variant analysis, same bug, different call path |
-| `ppp-fixed` (`8d7970b8`) | **no hit in `eap.c`** — the guard now bounds the copy length |
-| variant (`tlv_server.c`) | hit at `tlv_server.c:78` in `handle_hello()`; **no hit** at `tlv_server.c:104` in `handle_echo()`, which bounds `vlen` against `sizeof(buf)` |
+Measured on the VM (CodeQL bundle in `~/codeql`, evaluation 30 s per pppd database, 7 s for
+the variant):
 
-Anything else on the pppd databases is a Phase-4 triage item — the basic query has no
-source modelling, so extra hits are expected there. Record the counts.
+| Database | Hits | Detail |
+| -------- | ---- | ------ |
+| `ppp-vuln` (2.4.8) | 4 | `eap.c:1428` in `eap_request()` — **the CVE**; `eap.c:1854` in `eap_response()` — free variant analysis, same bug, different call path; plus `temp` (1024 B, length `minlen`) and `passbuf` (48 B, length `length`) |
+| `ppp-fixed` (`8d7970b8`) | 2 | **both `rhostname` hits gone**; `temp` and `passbuf` remain |
+| variant (`tlv_server.c`) | 1 | `tlv_server.c:78` in `handle_hello()`; **no hit** at `tlv_server.c:104` in `handle_echo()`, which bounds `vlen` against `sizeof(buf)` |
+
+The vuln-minus-fixed difference is the result: patch `8d7970b8` touches only `eap.c`, and
+only the `eap.c` findings disappear. No query edits between the two runs.
+
+`temp`/`minlen` and `passbuf`/`length` survive the patch, so they are not the CVE. They are
+untriaged — the basic query has no source modelling, so hits on lengths that are not
+attacker-derived are expected. Triage them from the `analyze` CSV (locations are also in the
+`query run` message since the query prints `file:line in function()`); taint tracking is the
+Phase 2 step that should drop them if they are false positives.
 
 ## Limitations of this basic version (and what comes next)
 

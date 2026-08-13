@@ -128,8 +128,16 @@ string describeLength(Expr e) {
   not e instanceof BinaryOperation and result = e.toString()
 }
 
-/** The alert message, shared so both queries report findings identically. */
+/**
+ * The alert message, shared so both queries report findings identically.
+ *
+ * The `unguardedCopy` conjunct is not redundant. `destSize` is an `int`, an infinite
+ * domain, so it has to be bound by a generative conjunct inside this predicate — the
+ * class-typed parameters bind from their own types, but a primitive one does not. It
+ * also restricts the message to actual findings.
+ */
 string alertMessage(CopyCall call, LocalVariable dest, int destSize) {
+  unguardedCopy(call, dest, destSize) and
   result =
     call.getLocation().getFile().getBaseName() + ":" +
       call.getLocation().getStartLine().toString() + " in " +

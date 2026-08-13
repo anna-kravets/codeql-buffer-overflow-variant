@@ -1,24 +1,29 @@
-# Part 3 CodeQL query — running it from the VM
+# Part 3 CodeQL queries — running them from the VM
 
-`UnboundedCopyToFixedBuffer.ql` is the **basic (Phase 2, step 1)** version of the Part 3
-query for **CVE-2020-8597** — the pppd EAP `rhostname` stack buffer overflow. It is
-sink-centric: no taint tracking yet, no source modelling, no function-pointer bridging.
-Those are the next steps (see *Limitations* below).
+Queries for **CVE-2020-8597**, the pppd EAP `rhostname` stack buffer overflow.
 
-For what the query decides and why, see [`query-explained.md`](query-explained.md).
+| File | What it is |
+| ---- | ---------- |
+| `CopyToFixedBuffer.qll` | Shared library: the sink shape and the guard test. Both queries import it, so the only difference between their results is taint. |
+| `UnboundedCopyToFixedBuffer.ql` | **Phase 2 step 1** — sink shape only, no taint. Verified on all three databases. |
+| `UnboundedCopyTainted.ql` | **Phase 2 steps 2–4** — same sink, plus the length must be attacker-derived. Not yet verified. |
+| `SourceProbe.ql` | Diagnostic. Run it before the taint query. |
+
+For what the queries decide and why, see [`query-explained.md`](query-explained.md).
 
 > **Run everything below inside the course VM.** Building a CodeQL database means running
 > the target's real build (`make`), which is what the "VM only" rule is about. Query
 > execution itself never runs the analysed code — it only reads the database — but keeping
-> the CLI, the query pack and both databases on one machine avoids the CodeQL
+> the CLI, the query pack and all three databases on one machine avoids the CodeQL
 > version-mismatch trap and keeps the demo reproducible.
 
-## What the query looks for
+## What the queries look for
 
 > A `memcpy`-family call whose destination is a fixed-size stack buffer and whose length
-> operand is never compared against that buffer's size.
+> operand is never compared against that buffer's size — and, in the tainted version, is
+> derived from attacker input.
 
-Three conditions, all in `UnboundedCopyToFixedBuffer.ql`:
+Three sink-side conditions, all in `CopyToFixedBuffer.qll`:
 
 1. **Sink shape** — `memcpy` / `memmove` / `strncpy` (plus the `__builtin*` and FORTIFY
    `_chk` spellings) writing into a local array of known size. pppd's `BCOPY(s, d, l)`
@@ -31,11 +36,15 @@ Three conditions, all in `UnboundedCopyToFixedBuffer.ql`:
 
 Condition 3 is the whole point. pppd **does** have a bounds check —
 `if (vallen >= len + sizeof (rhostname))` at `eap.c:1423` — and a naive "is there a check
-mentioning `sizeof(dest)`?" query is silenced by it. This query compares *value numbers*:
+mentioning `sizeof(dest)`?" query is silenced by it. The query compares *value numbers*:
 the check bounds `vallen`, the copy length is `len - vallen`, different value → not a
 guard → still reported. The patch changes the comparison to `len - vallen >= sizeof
 (rhostname)`, which **is** the copy length → guard recognised → patched tree goes quiet.
 One predicate, both verdicts.
+
+`UnboundedCopyTainted.ql` adds a fourth condition: taint must reach the length operand
+from either a `RemoteFlowSource` or a dispatch-table handler's parameter. See
+[`query-explained.md`](query-explained.md) for why the second source kind is needed.
 
 ## Prerequisites
 
@@ -65,81 +74,123 @@ codeql database create db --language=cpp --command="make"
 
 **Verify:** `Successfully created database at ...db`. (`db/` is already gitignored.)
 
-## 2. Compile the query first
+## 2. Compile before running
 
 Cheapest possible check that every predicate and import name exists in *your* bundle —
-seconds, no database needed. Run this after every edit, before running.
+seconds, no database needed. Run this after every edit.
 
 ```bash
-codeql query compile ~/part3/codeql-buffer-overflow-variant/codeql/UnboundedCopyToFixedBuffer.ql
+cd ~/part3/codeql-buffer-overflow-variant/codeql
+codeql query compile UnboundedCopyToFixedBuffer.ql UnboundedCopyTainted.ql SourceProbe.ql
 ```
 
-If it fails on `codeql/cpp-all` resolution, point the CLI at the bundle explicitly:
+If it fails on `codeql/cpp-all` resolution, point the CLI at the bundle explicitly with
+`--search-path ~/codeql`.
+
+**Fallback ladder if the taint query does not compile.** These names are newer than the
+rest and vary by bundle version; the sink-only query is unaffected either way.
+
+| Error mentions | Try instead |
+| -------------- | ----------- |
+| `globalValueNumber` | import `semmle.code.cpp.valuenumbering.HashCons`, use `hashCons(...)` |
+| `DataFlow::ConfigSig` or `TaintTracking::Global` | pre-2023 bundle: replace the module with `class Cfg extends TaintTracking::Configuration` and `isSource` / `isSink` member predicates |
+| `asParameter(_)` | drop the argument: `source.asParameter() = handler.getAParameter()` — scalar parameters only, which is enough for the variant but **not** for pppd, whose length is re-read from the packet body |
+| `semmle.code.cpp.security.FlowSources` | drop the `RemoteFlowSource` disjunct entirely and rely on dispatch-table parameters; record this in the write-up as a limitation |
+
+## 3. Probe the sources first
 
 ```bash
-codeql query compile --search-path ~/codeql <query.ql>
+Q=~/part3/codeql-buffer-overflow-variant/codeql
+codeql query run "$Q/SourceProbe.ql" --database=$HOME/part3/ppp-vuln/db --threads=0
 ```
 
-If it fails on `globalValueNumber`, the equivalent library in your bundle is
-`semmle.code.cpp.valuenumbering.HashCons` — swap the import and use `hashCons(...)` in
-`lengthCheckedAgainstDestSize`. Both ship with the C/C++ pack; which one is present
-depends on the bundle version, and `query compile` is what settles it.
+Two things to read off the result:
 
-## 3. Run it
+- **Does any `RemoteFlowSource` appear at all**, and in particular in `read_packet()`
+  (`sys-linux.c`)? If not, the pack does not model pppd's PPP `read()` as remote input and
+  the taint query is relying entirely on the dispatch-table sources.
+- **Is `eap_input` listed as a dispatch-table handler?** It must be — pppd registers it in
+  `struct protent eap_protent`. If it is missing, `dispatchTableTarget()` is not matching
+  pppd's initialiser shape and needs widening before the taint query can work.
+
+Run the same probe on the variant DB; `handle_hello` and `handle_echo` should both appear.
+
+## 4. Run the queries
 
 ```bash
-Q=~/part3/codeql-buffer-overflow-variant/codeql/UnboundedCopyToFixedBuffer.ql
+Q=~/part3/codeql-buffer-overflow-variant/codeql
 
-codeql query run "$Q" --database=$HOME/part3/ppp-vuln/db   --threads=0   # the CVE
-codeql query run "$Q" --database=$HOME/part3/ppp-fixed/db  --threads=0   # negative control
-codeql query run "$Q" --database=$HOME/part3/codeql-buffer-overflow-variant/db --threads=0
+for db in ppp-vuln ppp-fixed codeql-buffer-overflow-variant; do
+  echo "=== $db ==="
+  codeql query run "$Q/UnboundedCopyToFixedBuffer.ql" --database=$HOME/part3/$db/db --threads=0
+  codeql query run "$Q/UnboundedCopyTainted.ql"       --database=$HOME/part3/$db/db --threads=0
+done
 ```
 
 For results that go into the write-up (stable, quotable, countable), use `analyze` instead
-— the query carries `@id` and `@kind` metadata, so both CSV and SARIF work:
+— both queries carry `@id` and `@kind` metadata, and the tainted one is `path-problem`, so
+SARIF also carries the full source→sink path:
 
 ```bash
-codeql database analyze $HOME/part3/ppp-vuln/db "$Q" \
-    --format=csv --output=results-ppp-vuln.csv
+codeql database analyze $HOME/part3/ppp-vuln/db "$Q/UnboundedCopyTainted.ql" \
+    --format=sarif-latest --output=tainted-ppp-vuln.sarif
 ```
 
-## 4. Expected results
+## 5. Results
 
-Measured on the VM (CodeQL bundle in `~/codeql`, evaluation 30 s per pppd database, 7 s for
-the variant):
+### `UnboundedCopyToFixedBuffer.ql` — measured on the VM
+
+Evaluation 30 s per pppd database cold, ~2.5 s warm; 1.6–7 s for the variant.
 
 | Database | Hits | Detail |
 | -------- | ---- | ------ |
-| `ppp-vuln` (2.4.8) | 4 | `eap.c:1428` in `eap_request()` — **the CVE**; `eap.c:1854` in `eap_response()` — free variant analysis, same bug, different call path; plus `temp` (1024 B, length `minlen`) and `passbuf` (48 B, length `length`) |
-| `ppp-fixed` (`8d7970b8`) | 2 | **both `rhostname` hits gone**; `temp` and `passbuf` remain |
+| `ppp-vuln` (2.4.8) | 4 | `eap.c:1428` in `eap_request()` — **the CVE**; `eap.c:1854` in `eap_response()` — free variant analysis, same bug, different call path; plus `chat.c:1509` in `get_string()` (`temp`, 1024 B, length `minlen`) and `sendserver.c:104` in `rc_pack_list()` (`passbuf`, 48 B, length `length`) |
+| `ppp-fixed` (`8d7970b8`) | 2 | **both `rhostname` hits gone**; `chat.c` and `sendserver.c` remain |
 | variant (`tlv_server.c`) | 1 | `tlv_server.c:78` in `handle_hello()`; **no hit** at `tlv_server.c:104` in `handle_echo()`, which bounds `vlen` against `sizeof(buf)` |
 
 The vuln-minus-fixed difference is the result: patch `8d7970b8` touches only `eap.c`, and
 only the `eap.c` findings disappear. No query edits between the two runs.
 
-`temp`/`minlen` and `passbuf`/`length` survive the patch, so they are not the CVE. They are
-untriaged — the basic query has no source modelling, so hits on lengths that are not
-attacker-derived are expected. Triage them from the `analyze` CSV (locations are also in the
-`query run` message since the query prints `file:line in function()`); taint tracking is the
-Phase 2 step that should drop them if they are false positives.
+`chat.c:1509` and `sendserver.c:104` survive the patch, so they are not the CVE. Neither is
+confirmed a false positive — the sink-only query has no notion of "attacker-controlled", so
+a hit means "unguarded", not "exploitable". `chat.c` is the dial-script tool, where `minlen`
+derives from the expect string, i.e. local config; `sendserver.c` is the RADIUS plugin
+packing an *outgoing* request. Read both before writing either into the report, and look
+specifically for a clamp (`if (n > N) n = N;`) — a clamp against a constant that is not
+literally the destination size is a genuine precision gap in condition 3, not a source-scope
+issue.
 
-## Limitations of this basic version (and what comes next)
+### `UnboundedCopyTainted.ql` — prediction, not yet measured
 
-Deliberate — this is the crude first version the Phase 2 plan calls for. Each line below is
-a step in `sp-final-project/part 3/plan.md` §Phase 2:
+Recorded before running, so the write-up can show a falsifiable claim rather than a demo:
 
-- **No taint tracking.** Any unguarded length flags, whether or not it is attacker-derived.
-  Next: `TaintTracking::Global<...>` from remote sources (`read`/`recvfrom`) to the length
-  argument.
-- **No source modelling**, therefore nothing yet depends on whether CodeQL's default taint
-  model crosses the indirect call through pppd's `protent.input` table (`main.c:1092`) or
-  the variant's `ops[i].handle` table (`tlv_server.c:120`). That is the flagged unknown, and
-  it only bites once taint is added.
+| Database | Predicted | Meaning if it holds |
+| -------- | --------- | ------------------- |
+| `ppp-vuln` | **2** — `eap.c:1428`, `eap.c:1854` | taint crosses the `protent.input` table and both non-CVE hits are source-scope, not precision, problems |
+| `ppp-fixed` | **0** | the guard test still works under taint |
+| variant | **1** — `tlv_server.c:78` | taint crosses `ops[i].handle` too |
+
+**Run the variant first** — seconds instead of half a minute, same question. If it returns
+0, taint is not crossing the function-pointer table and there is no point spending a pppd
+run; fix that first with `SourceProbe.ql`.
+
+The failure mode to watch for is 0 / 0 / 0. That does not mean the code is safe; it means
+taint never reached the sink, and the query is silently useless. Any result must be read
+against the sink-only numbers above.
+
+## Limitations and what remains
+
 - **Guard scope is the whole function**, not "guard control-flow-dominates the sink". Sound
-  enough for both targets; tighten with `GuardCondition.controls(...)` if Phase 4 turns up
-  a false negative.
+  enough for both targets; tighten with `GuardCondition.controls(...)` if triage turns up a
+  false negative.
 - **Stack buffers only** (`LocalVariable`). Globals and heap allocations are out of scope.
 - **Byte-element arrays assumed** — `destSize` is the array's size in bytes, compared
   directly against a `memcpy` length. True for `char[]` in both targets.
 - **Copy-family calls only.** pppd's one-byte NUL write `rhostname[len - vallen] = '\0'`
   (`eap.c:1429`) is a second out-of-bounds write and is not matched.
+- **Dispatch-table sources are an over-approximation.** Any function stored in a
+  function-pointer table has all its parameters treated as attacker-controlled. Justified
+  for protocol dispatchers, wrong in general — state it in the write-up rather than hiding
+  it.
+- **No clamp recognition.** `if (n > N) n = N;` where `N` is a constant smaller than the
+  destination is a real guard the query does not see. Add only if triage shows it matters.

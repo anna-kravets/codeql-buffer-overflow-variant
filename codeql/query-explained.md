@@ -1,19 +1,26 @@
-# How `UnboundedCopyToFixedBuffer.ql` works
+# How the Part 3 queries work
 
-Running it: see [`README.md`](README.md). This file explains what it decides and why.
+Running them: see [`README.md`](README.md). This file explains what they decide and why.
 
 ## The bug class
 
-> A `memcpy`-family call writes into a **fixed-size stack buffer** using a length that is
-> **never compared against that buffer's size**.
+> A `memcpy`-family call writes into a **fixed-size stack buffer** using an
+> **attacker-derived length** that is **never compared against that buffer's size**.
 
 CWE-120 / CWE-121 / CWE-787. Instance: **CVE-2020-8597**, pppd's EAP `rhostname` overflow
-(CVSS 3.1 9.8). Course anchor: `lectures/12. Static Analysis.md` (sinks, guards, variant
-analysis) and `lectures/5. Buffer Overflow Attack.md` (why a 256-byte stack array matters).
+(CVSS 3.1 9.8). Course anchors: `lectures/12. Static Analysis.md` (sources, sinks, taint vs
+data flow, variant analysis) and `lectures/5. Buffer Overflow Attack.md`.
 
-## Three conditions
+## Two queries, one library
 
-A call is reported when all three hold.
+`CopyToFixedBuffer.qll` holds the sink shape and the guard test. Both queries import it and
+neither redefines anything, so the only difference between their result sets is the taint
+condition. That is deliberate: the comparison is only evidence if nothing else changed.
+
+- `UnboundedCopyToFixedBuffer.ql` — conditions 1–3. Verified.
+- `UnboundedCopyTainted.ql` — conditions 1–4. Written, not yet verified.
+
+## Conditions 1–3: the sink
 
 **1. Sink shape — `copiesIntoFixedBuffer`**
 The call targets `memcpy`, `memmove`, `strncpy` or their `__builtin*` / FORTIFY `_chk`
@@ -24,7 +31,8 @@ excluded on purpose: its destination is argument 1. pppd's `BCOPY(s, d, l)` macr
 
 **2. Length is not a safe constant — `constantLength`**
 A compile-time constant length that fits the destination is safe by construction and is
-dropped. This removes pppd's trimming branch at `eap.c:1425`, `BCOPY(..., sizeof (rhostname) - 1)`.
+dropped. This removes pppd's trimming branch at `eap.c:1425`,
+`BCOPY(..., sizeof (rhostname) - 1)`.
 
 **3. No guard on the length — `lengthCheckedAgainstDestSize`**
 No comparison anywhere in the enclosing function satisfies **both** of:
@@ -32,9 +40,9 @@ No comparison anywhere in the enclosing function satisfies **both** of:
 - one operand has the same **global value number** as the copy's length expression, and
 - the other operand **is** `sizeof(dest)` or the array's literal size — not merely contains it.
 
-If no such comparison exists, the copy is unguarded and the call is reported.
+If no such comparison exists, the copy is unguarded.
 
-## Why condition 3 is the whole query
+## Why condition 3 is the interesting one
 
 pppd is not missing a bounds check. It has one, at `eap.c:1423`:
 
@@ -61,26 +69,78 @@ Global value numbering (`semmle.code.cpp.valuenumbering.GlobalValueNumbering`) i
 "the same value, however it is spelled" decidable. Syntactic comparison would not survive the
 patch's reordering.
 
-## How each target lands
+## Condition 4: taint
 
-| Site | Check present? | Which half fails | Verdict |
-| ---- | -------------- | ---------------- | ------- |
-| `eap.c:1428` `rhostname` (vuln) | yes, dead | both — wrong value **and** wrong bound | **reported** — the CVE |
-| `eap.c:1854` `rhostname` (vuln) | yes, dead | both | **reported** — same bug, different call path |
-| `eap.c` `rhostname` (patched) | yes, live | neither | silent |
-| `tlv_server.c:78` `name` | yes, `vlen > plen - 2` | bound only — `plen - 2` is the frame size, not `sizeof(name)` | **reported** |
-| `tlv_server.c:104` `buf` | yes, `vlen >= sizeof(buf)` | neither | silent |
+The write-up argues (§5, §8) that this CVE needs taint tracking, not plain data flow: the
+length does not survive as one value. `get_input()` computes `len` from `read()`'s return,
+`eap_input()` discards it and re-reads a *new* length field out of the packet body, and
+`eap_request()` copies `len - vallen`. Every hop is a new value built from attacker bytes.
+Data flow follows identity; taint follows influence. `UnboundedCopyTainted.ql` is what makes
+that argument true of the query and not just of the prose.
 
-Note the split: pppd fails on the **value-number** half, `handle_hello` fails on the **bound**
-half. Two distinct ways to get the same bug class, one predicate catching both — that is the
-variant analysis the assignment asks for.
+`TaintTracking::Global<UnboundedCopyConfig>`, source → the length operand of a copy that has
+already failed conditions 1–3. Restricting the sink set inside the configuration rather than
+in the `where` clause keeps the flow computation small, which matters on the VM's 1.3 GB
+evaluator heap.
 
-## What it deliberately does not do
+### Two kinds of source, and why the second exists
 
-This is the crude first version (Phase 2, step 1). No taint tracking, so an unguarded length
-is flagged whether or not it is attacker-derived; no source modelling, so nothing yet depends
-on whether taint crosses pppd's `protent.input` table or the variant's `ops[].handle` table;
-guard scope is the whole function rather than control-flow dominance; stack buffers only;
-copy-family calls only, so pppd's one-byte `rhostname[len - vallen] = '\0'` at `eap.c:1429` is
-a second out-of-bounds write that goes unmatched. Full list and next steps in
-[`README.md`](README.md#limitations-of-this-basic-version-and-what-comes-next).
+**`RemoteFlowSource`** is the C/C++ pack's own model of network input. It is the right answer
+whenever it fires.
+
+**Dispatch-table handler parameters** are the fallback, and they are what make the query work
+on both targets. Neither program calls the vulnerable handler by name:
+
+```c
+/* pppd — main.c dispatches through this table */
+struct protent eap_protent = { PPP_EAP, eap_init, eap_input, ... };
+    (*protp->input)(0, p, len);          /* the string "eap_input" is nowhere here */
+
+/* variant — tlv_server.c dispatches through a different one */
+static const struct op ops[] = { {1, handle_hello}, {2, handle_echo} };
+    ops[i].handle(payload, plen);        /* likewise for "handle_hello" */
+```
+
+If the pack's inter-procedural model does not resolve that indirect call, taint from the real
+`read()` never arrives and the query finds nothing. `dispatchTableTarget()` recognises any
+function whose address is stored in an aggregate initialiser or assigned into a struct field,
+and treats its parameters as tainted — picking taint up on the far side of the edge.
+
+It names neither table, so it generalises to any dispatch-table design. That matters for
+grading: the assignment asks for a query that survives a *different structure and call chain*,
+and these two tables have different shapes, different depths and different struct layouts.
+
+Be honest about the cost. This is an **over-approximation**: it assumes any function reachable
+only through a function-pointer table is reachable with attacker-supplied arguments. For a
+protocol dispatcher that is exactly true. In general it is not, and the write-up should say so
+rather than hide it.
+
+`SourceProbe.ql` exists to tell these two source kinds apart before running the real query —
+so an empty result is diagnosable instead of mysterious.
+
+## How each site lands
+
+| Site | Check present? | Which half fails | Sink-only | Tainted (predicted) |
+| ---- | -------------- | ---------------- | --------- | ------------------- |
+| `eap.c:1428` `rhostname` (vuln) | yes, dead | both — wrong value **and** wrong bound | **hit** — the CVE | **hit** |
+| `eap.c:1854` `rhostname` (vuln) | yes, dead | both | **hit** — same bug, other path | **hit** |
+| `eap.c` `rhostname` (patched) | yes, live | neither | silent | silent |
+| `chat.c:1509` `temp` | no | — | hit | silent — `minlen` is from local config |
+| `sendserver.c:104` `passbuf` | unread | — | hit | silent — outgoing RADIUS packing |
+| `tlv_server.c:78` `name` | yes, `vlen > plen - 2` | bound only — `plen - 2` is the frame size, not `sizeof(name)` | **hit** | **hit** |
+| `tlv_server.c:104` `buf` | yes, `vlen >= sizeof(buf)` | neither | silent | silent |
+
+Note the split in the two vulnerable sites: pppd fails on the **value-number** half,
+`handle_hello` fails on the **bound** half. Two distinct ways to reach the same bug class, one
+predicate catching both — that is the variant analysis the assignment asks for.
+
+The last two columns are the experiment. The tainted predictions are recorded before the run,
+not after; if they do not hold, the reason is the finding.
+
+## What is still not modelled
+
+Guard scope is the whole enclosing function rather than control-flow dominance. Stack buffers
+only. Array sizes assumed to be in bytes (true for `char[]` in both targets). Copy-family
+calls only, so pppd's one-byte `rhostname[len - vallen] = '\0'` at `eap.c:1429` — a second
+out-of-bounds write — goes unmatched. No recognition of the clamp idiom `if (n > N) n = N;`.
+Full list in [`README.md`](README.md#limitations-and-what-remains).

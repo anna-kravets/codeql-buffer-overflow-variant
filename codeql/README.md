@@ -187,12 +187,31 @@ was added. **Both held exactly.**
 Evaluation 18.6 s / 10.9 s / 9.1 s (sink-only: 2.5 / 2.9 / 4.6 s). Adding `handle_stat`
 changed nothing on either pppd database, which is what it should do.
 
-**`handle_stat` is the value-numbering test and it passed.** Its only comparison naming the
-buffer is `hlen >= sizeof(report)`, and the query rejected it because `hlen` and `blen` are
-different values. Drop `globalValueNumber` from `lengthCheckedAgainstDestSize` and that
-comparison satisfies the bound half, the copy is treated as guarded, and this finding
-disappears — while every other verdict stays put. Worth running once as an ablation: it turns
-the justification for that predicate from an argument into a measurement.
+### Ablation — does global value numbering earn its place?
+
+Comment the value-number conjunct out of `lengthCheckedAgainstDestSize`, change nothing else,
+rerun. The weaker query is then the naive *"is there any comparison here with an operand that
+is `sizeof(dest)`?"*. Measured:
+
+| Database | Sink-only | Tainted |
+| -------- | --------- | ------- |
+| `ppp-vuln` | 4 → **3** | 2 → **2** |
+| `ppp-fixed` | 2 → **1** | 0 → **0** |
+| variant | 2 → **1** | 2 → **1** |
+
+Two findings lost, **none gained** — every difference is a false negative introduced, so the
+predicate never costs a result at these targets.
+
+- `tlv_server.c:145` `handle_stat` — what it was built for. `hlen >= sizeof(report)` satisfies
+  the bound half on its own, so without value numbering the copy looks guarded.
+- `chat.c:1509` `get_string` — unplanned. For the weaker query to accept it, `get_string()`
+  must contain a comparison whose operand really is `sizeof(temp)` or `1024`; for the full
+  query to reject it, that comparison must not bound `minlen`. That makes it a third instance
+  of the CVE-2020-8597 wrong-operand pattern, in an unrelated pppd component. Confirm by
+  reading the source before quoting it.
+
+Reproduce: comment line 97 of `CopyToFixedBuffer.qll`, rerun the loop above, then
+`git checkout codeql/CopyToFixedBuffer.qll`. No database rebuild — only the query changes.
 
 **Two path shapes inside one file.** The variant's `nodes` table shows `handle_stat` reached
 through `payload` → *access to array* → `blen` (a single subscript, `payload[1]`), and

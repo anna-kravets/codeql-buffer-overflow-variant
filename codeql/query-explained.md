@@ -191,12 +191,20 @@ function-pointer tables, which was the largest open risk in the plan. The two no
 rows went silent, so they were source-scope, not precision, problems: precision on the
 vulnerable tree is 2 of 2, and the patched tree returns nothing at all.
 
-`handle_stat` fired, which is what the value half of condition 3 exists for. Its only
-comparison naming the buffer is `hlen >= sizeof(report)`, rejected because `hlen` and `blen`
-are different values. Remove `globalValueNumber` and that comparison satisfies the bound half,
-the copy is treated as guarded, and this one finding disappears while every other verdict
-holds — an ablation worth running once, since it converts the argument for that predicate into
-a measurement.
+`handle_stat` fired, which is what the value half of condition 3 exists for. That was then
+checked by ablation — value numbering commented out, nothing else changed:
+
+| Database | Sink-only | Tainted |
+| -------- | --------- | ------- |
+| `ppp-vuln` | 4 → **3** | 2 → **2** |
+| `ppp-fixed` | 2 → **1** | 0 → **0** |
+| variant | 2 → **1** | 2 → **1** |
+
+Two findings lost — `tlv_server.c:145` and `chat.c:1509` — and none gained. The predicate is
+pure benefit at these targets. `chat.c` was not expected: its disappearance means
+`get_string()` contains a comparison that really does name the destination size while failing
+to bound the copy length, i.e. a third instance of the CVE-2020-8597 shape. See
+[`README.md`](README.md) for the full note.
 
 The variant's `nodes` table also shows the two handlers reached by *different expression
 shapes*: `handle_stat` through `payload` → *access to array* → `blen` (the single subscript

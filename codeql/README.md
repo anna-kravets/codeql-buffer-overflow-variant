@@ -164,14 +164,17 @@ Evaluation 30 s per pppd database cold, ~2.5 s warm; 1.6–7 s for the variant.
 The vuln-minus-fixed difference is the result: patch `8d7970b8` touches only `eap.c`, and
 only the `eap.c` findings disappear. No query edits between the two runs.
 
-`chat.c:1509` and `sendserver.c:104` survive the patch, so they are not the CVE. Neither is
-confirmed a false positive — the sink-only query has no notion of "attacker-controlled", so
-a hit means "unguarded", not "exploitable". `chat.c` is the dial-script tool, where `minlen`
-derives from the expect string, i.e. local config; `sendserver.c` is the RADIUS plugin
-packing an *outgoing* request. Read both before writing either into the report, and look
-specifically for a clamp (`if (n > N) n = N;`) — a clamp against a constant that is not
-literally the destination size is a genuine precision gap in condition 3, not a source-scope
-issue.
+`chat.c:1509` and `sendserver.c:104` survive the patch, so they are not the CVE, and both are
+dropped by the tainted query because neither length is network-derived.
+
+`chat.c:1509` was then read and is a **confirmed false positive**: line 1400 returns rather
+than truncating, so `len <= STR_LEN` at the copy and `minlen = max(len, sizeof(fail_buffer)) - 1
+<= 1023 < sizeof(temp)`. The guard bounds `len`; the copy length `minlen` is derived from it,
+and carrying the bound across that derivation needs range analysis. See the ablation note
+below.
+
+`sendserver.c:104` is **untriaged** — out of scope under taint either way, but unread, so no
+claim either direction.
 
 ### `UnboundedCopyTainted.ql` — measured
 
@@ -199,16 +202,27 @@ is `sizeof(dest)`?"*. Measured:
 | `ppp-fixed` | 2 → **1** | 0 → **0** |
 | variant | 2 → **1** | 2 → **1** |
 
-Two findings lost, **none gained** — every difference is a false negative introduced, so the
-predicate never costs a result at these targets.
+Two findings disappear, and they are different kinds of thing.
 
-- `tlv_server.c:145` `handle_stat` — what it was built for. `hlen >= sizeof(report)` satisfies
-  the bound half on its own, so without value numbering the copy looks guarded.
-- `chat.c:1509` `get_string` — unplanned. For the weaker query to accept it, `get_string()`
-  must contain a comparison whose operand really is `sizeof(temp)` or `1024`; for the full
-  query to reject it, that comparison must not bound `minlen`. That makes it a third instance
-  of the CVE-2020-8597 wrong-operand pattern, in an unrelated pppd component. Confirm by
-  reading the source before quoting it.
+- `tlv_server.c:145` `handle_stat` — **a true positive lost**, the case it was built for.
+  `hlen >= sizeof(report)` satisfies the bound half on its own, so without value numbering the
+  copy looks guarded.
+- `chat.c:1509` `get_string` — **a false positive lost**, by accident. The weak query accepts
+  `len > STR_LEN` because `STR_LEN` is the literal 1024 = `sizeof(temp)`, without caring that
+  the guarded value is `len` while the copy length is `minlen`. Reading the source
+  (`chat.c:1387–1410`) confirms the copy really is safe: line 1400 *returns* rather than
+  truncating, so `len <= 1024` at the copy and `minlen = max(len, sizeof(fail_buffer)) - 1 <= 1023`.
+  The query cannot see that — the guard bounds a *predecessor* of the copy length, which needs
+  range analysis, not value equality.
+
+| Query | Effect of removing value numbering |
+| ----- | ---------------------------------- |
+| Sink-only | loses one true positive **and** one false positive — a trade |
+| **Tainted** | loses one true positive and nothing else — **pure gain** |
+
+`chat.c` never reaches the tainted results, so on the deliverable query value numbering costs
+nothing. The trade exists only on the baseline instrument — visible only because the two
+queries are kept separate.
 
 Reproduce: comment line 97 of `CopyToFixedBuffer.qll`, rerun the loop above, then
 `git checkout codeql/CopyToFixedBuffer.qll`. No database rebuild — only the query changes.
@@ -250,5 +264,7 @@ chains differing by a factor of forty.
   function-pointer table has all its parameters treated as attacker-controlled. Justified
   for protocol dispatchers, wrong in general — state it in the write-up rather than hiding
   it.
-- **No clamp recognition.** `if (n > N) n = N;` where `N` is a constant smaller than the
-  destination is a real guard the query does not see. Add only if triage shows it matters.
+- **No range analysis**, so a guard on a *predecessor* of the copy length is invisible. This is
+  the one confirmed false positive: `chat.c:1509` bounds `len` and copies `minlen`, which is
+  derived from `len`. The clamp idiom `if (n > N) n = N;` is the simplest case of the same gap.
+  Fixing it means interval reasoning, not another value-equality test.

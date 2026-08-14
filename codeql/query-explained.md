@@ -200,10 +200,15 @@ checked by ablation — value numbering commented out, nothing else changed:
 | `ppp-fixed` | 2 → **1** | 0 → **0** |
 | variant | 2 → **1** | 2 → **1** |
 
-Two findings lost — `tlv_server.c:145` and `chat.c:1509` — and none gained. The predicate is
-pure benefit at these targets. `chat.c` was not expected: its disappearance means
-`get_string()` contains a comparison that really does name the destination size while failing
-to bound the copy length, i.e. a third instance of the CVE-2020-8597 shape. See
+Two findings disappear and they differ in kind. `tlv_server.c:145` is a **true positive lost** —
+the case value numbering exists for. `chat.c:1509` is a **false positive lost**, shed by
+accident: the weak query accepts `len > STR_LEN` because `STR_LEN` is the literal 1024, without
+caring that it bounds `len` while the copy length is `minlen`. Reading `chat.c` confirms the
+copy is genuinely safe, via a bound the query cannot follow — it constrains a *predecessor* of
+the copy length, which needs range analysis rather than value equality.
+
+So removing value numbering is a trade on the sink-only query (one true positive for one false
+positive) and a **pure loss** on the tainted one, where `chat.c` never appears. See
 [`README.md`](README.md) for the full note.
 
 The variant's `nodes` table also shows the two handlers reached by *different expression

@@ -173,8 +173,18 @@ than truncating, so `len <= STR_LEN` at the copy and `minlen = max(len, sizeof(f
 and carrying the bound across that derivation needs range analysis. See the ablation note
 below.
 
-`sendserver.c:104` is **untriaged** — out of scope under taint either way, but unread, so no
-claim either direction.
+`sendserver.c:104` is the **same false positive in simpler form** — the clamp idiom:
+`if (length > AUTH_PASS_LEN) length = AUTH_PASS_LEN;`, with `AUTH_PASS_LEN` = 48 =
+`sizeof(passbuf)`. At the comparison `length` is `vp->lvalue`; at the copy it is a merge of
+that and `AUTH_PASS_LEN` — different values, correctly, since the reassignment is the point of
+a clamp.
+
+Both false positives share one root cause: **the guard constrains a value that flows into the
+copy length, not the copy length itself.** `chat.c` through a derivation, `sendserver.c`
+through a reassignment. One missing capability — range analysis — not two unrelated misses.
+
+Sink-only precision on `ppp-vuln` is therefore 2 of 4. That is the baseline instrument, not the
+deliverable; the tainted query is 2 of 2.
 
 ### `UnboundedCopyTainted.ql` — measured
 
@@ -264,7 +274,8 @@ chains differing by a factor of forty.
   function-pointer table has all its parameters treated as attacker-controlled. Justified
   for protocol dispatchers, wrong in general — state it in the write-up rather than hiding
   it.
-- **No range analysis**, so a guard on a *predecessor* of the copy length is invisible. This is
-  the one confirmed false positive: `chat.c:1509` bounds `len` and copies `minlen`, which is
-  derived from `len`. The clamp idiom `if (n > N) n = N;` is the simplest case of the same gap.
-  Fixing it means interval reasoning, not another value-equality test.
+- **No range analysis**, so a guard on a *predecessor* of the copy length is invisible. This
+  accounts for both confirmed false positives: `chat.c:1509` bounds `len` and copies `minlen`,
+  derived from it; `sendserver.c:104` bounds `length` and then clamps it, so the checked and
+  copied values differ by the assignment. Fixing it means interval reasoning —
+  `SimpleRangeAnalysis` is the obvious thing to try — not another value-equality test.

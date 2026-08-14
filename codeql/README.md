@@ -5,8 +5,8 @@ Queries for **CVE-2020-8597**, the pppd EAP `rhostname` stack buffer overflow.
 | File | What it is |
 | ---- | ---------- |
 | `CopyToFixedBuffer.qll` | Shared library: the sink shape and the guard test. Both queries import it, so the only difference between their results is taint. |
-| `UnboundedCopyToFixedBuffer.ql` | **Phase 2 step 1** — sink shape only, no taint. Verified on all three databases. |
-| `UnboundedCopyTainted.ql` | **Phase 2 steps 2–4** — same sink, plus the length must be attacker-derived. Verified: 2 / 0 / 1. |
+| `UnboundedCopyToFixedBuffer.ql` | **Phase 2 step 1** — sink shape only, no taint. Verified: 4 / 2 / 2. |
+| `UnboundedCopyTainted.ql` | **Phase 2 steps 2–4** — same sink, plus the length must be attacker-derived. Verified: 2 / 0 / 2. |
 | `SourceProbe.ql` | Diagnostic. Run it if the taint query returns nothing. |
 
 For what the queries decide and why, see [`query-explained.md`](query-explained.md).
@@ -159,14 +159,7 @@ Evaluation 30 s per pppd database cold, ~2.5 s warm; 1.6–7 s for the variant.
 | -------- | ---- | ------ |
 | `ppp-vuln` (2.4.8) | 4 | `eap.c:1428` in `eap_request()` — **the CVE**; `eap.c:1854` in `eap_response()` — free variant analysis, same bug, different call path; plus `chat.c:1509` in `get_string()` (`temp`, 1024 B, length `minlen`) and `sendserver.c:104` in `rc_pack_list()` (`passbuf`, 48 B, length `length`) |
 | `ppp-fixed` (`8d7970b8`) | 2 | **both `rhostname` hits gone**; `chat.c` and `sendserver.c` remain |
-| variant (`tlv_server.c`) | 1 | `tlv_server.c:78` in `handle_hello()`; **no hit** in `handle_echo()`, which bounds `vlen` against `sizeof(buf)` |
-
-> **Superseded for the variant.** `handle_stat()` was added after this run, so the variant
-> numbers above are stale and its line numbers shifted (`handle_hello` 78 → 80, `handle_echo`
-> 104 → 106, new sink at 145). Expected on a rebuilt database: **2** sink-only and **2**
-> tainted, `handle_hello` and `handle_stat`, with `handle_echo` still silent. The pppd numbers
-> are unaffected. Rebuild the variant database before rerunning — `database create` snapshots
-> the source.
+| variant (`tlv_server.c`) | 2 | `tlv_server.c:80` in `handle_hello()` (`name`, 64 B, length `vlen`) and `tlv_server.c:145` in `handle_stat()` (`report`, 32 B, length `blen`); **no hit** in `handle_echo()`, which bounds `vlen` against `sizeof(buf)` |
 
 The vuln-minus-fixed difference is the result: patch `8d7970b8` touches only `eap.c`, and
 only the `eap.c` findings disappear. No query edits between the two runs.
@@ -182,15 +175,29 @@ issue.
 
 ### `UnboundedCopyTainted.ql` — measured
 
-Prediction was recorded before the run: 2 / 0 / 1. **It held exactly.**
+Predictions were recorded before each run — 2 / 0 / 1 first, then 2 / 0 / 2 once `handle_stat`
+was added. **Both held exactly.**
 
 | Database | Findings | Paths | Detail |
 | -------- | -------- | ----- | ------ |
 | `ppp-vuln` | **2** | 4 | `eap.c:1428` and `eap.c:1854`. `chat.c` and `sendserver.c` are gone — they were unguarded copies of local data, never attacker-reachable. Precision 2/2. |
 | `ppp-fixed` | **0** | 0 | empty `#select`, empty edges and nodes. Nothing at all. |
-| variant | **1** | 2 | `tlv_server.c:78`, unchanged. Stale — see the note above; expect **2** now. |
+| variant | **2** | 4 | `tlv_server.c:80` `handle_hello`, `tlv_server.c:145` `handle_stat`. `handle_echo` silent. |
 
-Evaluation 38.9 s / 45.6 s / 8.8 s.
+Evaluation 18.6 s / 10.9 s / 9.1 s (sink-only: 2.5 / 2.9 / 4.6 s). Adding `handle_stat`
+changed nothing on either pppd database, which is what it should do.
+
+**`handle_stat` is the value-numbering test and it passed.** Its only comparison naming the
+buffer is `hlen >= sizeof(report)`, and the query rejected it because `hlen` and `blen` are
+different values. Drop `globalValueNumber` from `lengthCheckedAgainstDestSize` and that
+comparison satisfies the bound half, the copy is treated as guarded, and this finding
+disappears — while every other verdict stays put. Worth running once as an ablation: it turns
+the justification for that predicate from an argument into a measurement.
+
+**Two path shapes inside one file.** The variant's `nodes` table shows `handle_stat` reached
+through `payload` → *access to array* → `blen` (a single subscript, `payload[1]`), and
+`handle_hello` through `payload` → `... | ...` → `vlen` (the shift-and-or that combines two
+bytes). Same source, same sink kind, different expression forms in between, both followed.
 
 **Taint crossed the function-pointer table in both programs.** `eap_request` is reachable
 only via `protent.input` → `eap_input`, `handle_hello` only via `ops[i].handle`, and taint

@@ -17,8 +17,8 @@ data flow, variant analysis) and `lectures/5. Buffer Overflow Attack.md`.
 neither redefines anything, so the only difference between their result sets is the taint
 condition. That is deliberate: the comparison is only evidence if nothing else changed.
 
-- `UnboundedCopyToFixedBuffer.ql` — conditions 1–3. Verified: 4 / 2 / 1.
-- `UnboundedCopyTainted.ql` — conditions 1–4. Verified: 2 / 0 / 1.
+- `UnboundedCopyToFixedBuffer.ql` — conditions 1–3. Verified: 4 / 2 / 2.
+- `UnboundedCopyTainted.ql` — conditions 1–4. Verified: 2 / 0 / 2.
 
 ## Conditions 1–3: the sink
 
@@ -185,11 +185,23 @@ predicate, three shapes, and each half of it is load-bearing somewhere — that 
 analysis the assignment asks for, and it is also the answer to "why is that complexity in the
 query?"
 
-Taint results were predicted before the run — 2 / 0 / 1 at the time, before `handle_stat`
-existed — and came out exactly that. Taint crossed both function-pointer tables, which was the
-largest open risk in the plan. The two non-CVE pppd rows went silent, so they were
-source-scope, not precision, problems: precision on the vulnerable tree is 2 of 2, and the
-patched tree returns nothing at all.
+Taint results were predicted before each run — 2 / 0 / 1 before `handle_stat` existed, then
+2 / 0 / 2 after it was added — and came out exactly that both times. Taint crossed both
+function-pointer tables, which was the largest open risk in the plan. The two non-CVE pppd
+rows went silent, so they were source-scope, not precision, problems: precision on the
+vulnerable tree is 2 of 2, and the patched tree returns nothing at all.
+
+`handle_stat` fired, which is what the value half of condition 3 exists for. Its only
+comparison naming the buffer is `hlen >= sizeof(report)`, rejected because `hlen` and `blen`
+are different values. Remove `globalValueNumber` and that comparison satisfies the bound half,
+the copy is treated as guarded, and this one finding disappears while every other verdict
+holds — an ablation worth running once, since it converts the argument for that predicate into
+a measurement.
+
+The variant's `nodes` table also shows the two handlers reached by *different expression
+shapes*: `handle_stat` through `payload` → *access to array* → `blen` (the single subscript
+`payload[1]`), `handle_hello` through `payload` → `... | ...` → `vlen` (the shift-and-or). One
+source, one sink kind, two idioms, both followed.
 
 Each finding appears as two rows, sourced from `inp` and `*inp` (pppd) or `payload` and
 `*payload` (variant). `asParameter(_)` matches the parameter at every indirection level, so

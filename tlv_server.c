@@ -31,10 +31,11 @@
 #define LISTEN_PORT 4000
 #define RECV_BUF    2048
 
-enum { TLV_HELLO = 0x01, TLV_ECHO = 0x02 };
+enum { TLV_HELLO = 0x01, TLV_ECHO = 0x02, TLV_STAT = 0x03 };
 
 static void handle_hello(const uint8_t *payload, size_t plen);
 static void handle_echo(const uint8_t *payload, size_t plen);
+static void handle_stat(const uint8_t *payload, size_t plen);
 
 /*
  * Dispatch table. Deliberately a different shape from pppd's
@@ -49,6 +50,7 @@ struct frame_op {
 static const struct frame_op ops[] = {
 	{ TLV_HELLO, handle_hello },
 	{ TLV_ECHO,  handle_echo  },
+	{ TLV_STAT,  handle_stat  },
 };
 
 /*
@@ -104,6 +106,45 @@ static void handle_echo(const uint8_t *payload, size_t plen)
 	memcpy(buf, payload + 2, vlen);
 	buf[vlen] = '\0';
 	printf("echo: %s\n", buf);
+}
+
+/*
+ * VULNERABLE — the wrong-operand case, and the reason the query uses global
+ * value numbering.
+ *
+ * `handle_hello` above fails one way: its check constrains the copy length, but
+ * against the frame rather than the buffer. This one fails the other way. The
+ * check here names `sizeof(report)` correctly — it looks exactly like a buffer
+ * bound, and a query that merely asks "does some comparison in this function
+ * mention sizeof(dest)?" is silenced by it. But it constrains `hlen`, while the
+ * copy length is `blen`. They are two independent fields of the same
+ * attacker-supplied frame.
+ *
+ * Without value numbering this handler is a false negative. With it, the query
+ * sees that the guarded value and the copied length are different values and
+ * reports the copy. That is the same reasoning failure as pppd's
+ * `vallen >= len + sizeof (rhostname)` at eap.c:1423 — a check that mentions the
+ * destination size while constraining something that is not the copy length.
+ */
+static void handle_stat(const uint8_t *payload, size_t plen)
+{
+	char report[32];
+
+	if (plen < 2)
+		return;
+
+	size_t hlen = (size_t)payload[0];      /* declared header length */
+	size_t blen = (size_t)payload[1];      /* declared body length   */
+
+	if (hlen >= sizeof(report))            /* names the buffer, bounds the WRONG length */
+		return;
+
+	if (blen > plen - 2)                   /* bounds the frame, not the buffer */
+		return;
+
+	memcpy(report, payload + 2, blen);     /* SINK: blen never compared to sizeof(report) */
+	report[blen] = '\0';
+	printf("stat: header %zu bytes, body %s\n", hlen, report);
 }
 
 static void dispatch_frame(const uint8_t *frame, size_t n)

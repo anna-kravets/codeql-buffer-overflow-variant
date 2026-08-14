@@ -65,9 +65,39 @@ Now the checked value **is** the copy length and the bound **is** the size, so t
 predicate recognises it as a genuine guard and the patched tree goes quiet. One predicate,
 opposite verdicts, no query edits between the two runs — that is the negative control.
 
-Global value numbering (`semmle.code.cpp.valuenumbering.GlobalValueNumbering`) is what makes
-"the same value, however it is spelled" decidable. Syntactic comparison would not survive the
-patch's reordering.
+### Which half does the work, and where
+
+Worth being precise, because the two halves are not interchangeable and it is a fair question
+to be asked.
+
+**The bound half** — "the operand must *be* `sizeof(dest)`, not merely contain it" — is what
+decides pppd. `len + sizeof (rhostname)` is an addition, so it is rejected, and the patched
+form `sizeof (rhostname)` is accepted. Value numbering agrees with both verdicts but does not
+change either: strike it out and pppd's results are identical.
+
+**The value half** — global value numbering
+(`semmle.code.cpp.valuenumbering.GlobalValueNumbering`) — earns its place on a different
+shape, where a comparison *does* name the destination size but constrains the wrong variable.
+`handle_stat` in the variant is exactly that:
+
+```c
+if (hlen >= sizeof(report))            /* names the buffer, bounds the WRONG length */
+        return;
+...
+memcpy(report, payload + 2, blen);     /* the copy length is blen, not hlen */
+```
+
+Without value numbering, `sizeof(report)` satisfies the bound half and the copy is treated as
+guarded — a false negative. With it, `globalValueNumber(hlen) != globalValueNumber(blen)`, so
+the comparison is not accepted and the bug is reported.
+
+That is the informal description everyone gives of CVE-2020-8597 — *"a check that mentions the
+buffer size while constraining something that isn't the copy length"* — reproduced as a
+minimal, isolated case. pppd's own expression happens to fail the bound half as well, so it
+does not test this on its own.
+
+Value numbering also makes "the same value, however it is spelled" decidable, which is why the
+guard test survives the patch reordering its operands rather than depending on syntax.
 
 ## Condition 4: taint
 
@@ -145,17 +175,21 @@ result is diagnosable instead of mysterious.
 | `eap.c` `rhostname` (patched) | yes, live | neither | silent | silent |
 | `chat.c:1509` `temp` | no | — | hit | **silent** — length is from local config, not the network |
 | `sendserver.c:104` `passbuf` | not read | — | hit | **silent** — outgoing RADIUS packing |
-| `tlv_server.c:78` `name` | yes, `vlen > plen - 2` | bound only — `plen - 2` is the frame size, not `sizeof(name)` | **hit** | **hit** |
-| `tlv_server.c:104` `buf` | yes, `vlen >= sizeof(buf)` | neither | silent | silent |
+| `tlv_server.c:80` `name` | yes, `vlen > plen - 2` | **bound only** — `plen - 2` is the frame, not `sizeof(name)` | **hit** | **hit** |
+| `tlv_server.c:106` `buf` | yes, `vlen >= sizeof(buf)` | neither | silent | silent |
+| `tlv_server.c:145` `report` | yes, `hlen >= sizeof(report)` | **value only** — names the buffer, bounds the wrong length | **hit** | **hit** |
 
-Note the split in the two vulnerable sites: pppd fails on the **value-number** half,
-`handle_hello` fails on the **bound** half. Two distinct ways to reach the same bug class, one
-predicate catching both — that is the variant analysis the assignment asks for.
+The three vulnerable sites cover the space between them. pppd fails both halves;
+`handle_hello` fails only the bound half; `handle_stat` fails only the value half. One
+predicate, three shapes, and each half of it is load-bearing somewhere — that is the variant
+analysis the assignment asks for, and it is also the answer to "why is that complexity in the
+query?"
 
-The last column was predicted before the run — 2 / 0 / 1 — and came out exactly that. Taint
-crossed both function-pointer tables, which was the largest open risk in the plan. The two
-non-CVE pppd rows went silent, so they were source-scope, not precision, problems: precision
-on the vulnerable tree is 2 of 2, and the patched tree returns nothing at all.
+Taint results were predicted before the run — 2 / 0 / 1 at the time, before `handle_stat`
+existed — and came out exactly that. Taint crossed both function-pointer tables, which was the
+largest open risk in the plan. The two non-CVE pppd rows went silent, so they were
+source-scope, not precision, problems: precision on the vulnerable tree is 2 of 2, and the
+patched tree returns nothing at all.
 
 Each finding appears as two rows, sourced from `inp` and `*inp` (pppd) or `payload` and
 `*payload` (variant). `asParameter(_)` matches the parameter at every indirection level, so

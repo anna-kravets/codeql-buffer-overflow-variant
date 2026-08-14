@@ -1,6 +1,6 @@
 # codeql-buffer-overflow-variant
 
-A deliberately vulnerable, ~130-line C program used as a **CodeQL static-analysis
+A deliberately vulnerable, ~170-line C program used as a **CodeQL static-analysis
 target**. It reproduces the *bug class* of **CVE-2020-8597** — the pppd EAP
 `rhostname` stack buffer overflow (CWE-120) — in a program that shares none of
 pppd's function names, call depth, or dispatch structure.
@@ -17,10 +17,22 @@ class rather than the original code's shape.
 > An attacker-derived length is copied into a fixed-size buffer, with no guard
 > relating that length to the buffer's size.
 
-A bounds check is present — it just checks the wrong thing: the declared length
-is validated against the received frame (preventing an over-read) but never
-against `sizeof(dest)` (which is what prevents the over-write). This is the same
-root cause as pppd's dead `vallen >= len + sizeof(rhostname)` check.
+In every case a bounds check is present — it just fails to relate the two
+quantities that matter. There are exactly two ways to get that wrong, and the
+program contains one of each:
+
+- **Right value, wrong bound.** The copy length is checked, but against the
+  received frame instead of `sizeof(dest)`. Prevents an over-read, does nothing
+  about the over-write. (`handle_hello`)
+- **Right bound, wrong value.** The check names `sizeof(dest)` — it looks exactly
+  like a buffer bound — but constrains a different variable than the one used as
+  the copy length. (`handle_stat`)
+
+The second is the harder one, and it is what pppd's dead
+`vallen >= len + sizeof(rhostname)` check is: a comparison that mentions the
+destination size while constraining something that is not the copy length. A
+query that only asks *"does some comparison here mention `sizeof(dest)`?"* is
+silenced by it.
 
 ## Structure vs. pppd (why it's a real variant)
 
@@ -35,11 +47,18 @@ root cause as pppd's dead `vallen >= len + sizeof(rhostname)` check.
 Both keep the one property that makes this data-flow, not grep: an **indirect
 call through a function-pointer table** between the source and the sink.
 
-- `handle_hello()` — **vulnerable**. `memcpy(name, payload + 2, vlen)` with `vlen`
-  bounded by the frame, not by `sizeof(name)`.
-- `handle_echo()` — **safe**. Same source and sink shape, but `vlen` is also
-  bounded by `sizeof(buf)`. This is the **negative control**: the query must fire
-  on `handle_hello` and stay silent here.
+| Handler | Line | Check present | Verdict |
+| ------- | ---- | ------------- | ------- |
+| `handle_hello()` | sink at `:80` | `vlen > plen - 2` — right value, wrong bound | **must fire** |
+| `handle_echo()` | copy at `:106` | `vlen >= sizeof(buf)` — both right | **must stay silent** — negative control |
+| `handle_stat()` | sink at `:145` | `hlen >= sizeof(report)` — right bound, wrong value | **must fire** |
+
+`handle_stat` is the discriminating case. Its check names `sizeof(report)`, so a
+query that accepts any comparison mentioning the destination size treats it as
+guarded and misses the bug. Catching it requires comparing the *value* being
+checked against the *value* used as the copy length — global value numbering.
+Delete that from the query and this handler becomes a false negative while every
+other site keeps its verdict.
 
 ## Wire format
 
@@ -49,8 +68,10 @@ One UDP datagram = one frame:
 [ type : 1 ] [ length : 2, big-endian ] [ value : length bytes ]
 ```
 
-`type` 0x01 → hello, 0x02 → echo. A hello frame with a declared length between 65
-and ~2045 overflows `name[64]`.
+`type` 0x01 → hello, 0x02 → echo, 0x03 → stat. A hello frame with a declared
+length between 65 and ~2045 overflows `name[64]`. A stat frame carries two
+one-byte lengths instead — a header length and a body length — and any body
+length above 32 overflows `report[32]`, whatever the header length says.
 
 ## Build
 
@@ -71,5 +92,10 @@ codeql database create db --language=cpp --command="make"
 codeql database create db --language=cpp --command="make -B"
 ```
 
-Then run the Part 3 query against `db`; it should report the `memcpy` in
-`handle_hello` and not the one in `handle_echo`.
+Then run the Part 3 queries against `db`; they should report the `memcpy` in
+`handle_hello` and the one in `handle_stat`, and stay silent on `handle_echo`.
+The queries and their run instructions live in [`codeql/`](codeql/).
+
+The source changes whenever a handler is added, so **rebuild the database** —
+CodeQL snapshots the code at `database create` time and an existing `db/` will
+not see new code.

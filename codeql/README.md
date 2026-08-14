@@ -69,8 +69,12 @@ git clone <this-repo-url> codeql-buffer-overflow-variant
 
 ## 1. Build the variant database
 
+Redo this **every time `tlv_server.c` changes** — `database create` snapshots the source, so
+an existing `db/` will not see new code.
+
 ```bash
 cd ~/part3/codeql-buffer-overflow-variant
+rm -rf db
 make clean
 codeql database create db --language=cpp --command="make"
 ```
@@ -155,7 +159,14 @@ Evaluation 30 s per pppd database cold, ~2.5 s warm; 1.6–7 s for the variant.
 | -------- | ---- | ------ |
 | `ppp-vuln` (2.4.8) | 4 | `eap.c:1428` in `eap_request()` — **the CVE**; `eap.c:1854` in `eap_response()` — free variant analysis, same bug, different call path; plus `chat.c:1509` in `get_string()` (`temp`, 1024 B, length `minlen`) and `sendserver.c:104` in `rc_pack_list()` (`passbuf`, 48 B, length `length`) |
 | `ppp-fixed` (`8d7970b8`) | 2 | **both `rhostname` hits gone**; `chat.c` and `sendserver.c` remain |
-| variant (`tlv_server.c`) | 1 | `tlv_server.c:78` in `handle_hello()`; **no hit** at `tlv_server.c:104` in `handle_echo()`, which bounds `vlen` against `sizeof(buf)` |
+| variant (`tlv_server.c`) | 1 | `tlv_server.c:78` in `handle_hello()`; **no hit** in `handle_echo()`, which bounds `vlen` against `sizeof(buf)` |
+
+> **Superseded for the variant.** `handle_stat()` was added after this run, so the variant
+> numbers above are stale and its line numbers shifted (`handle_hello` 78 → 80, `handle_echo`
+> 104 → 106, new sink at 145). Expected on a rebuilt database: **2** sink-only and **2**
+> tainted, `handle_hello` and `handle_stat`, with `handle_echo` still silent. The pppd numbers
+> are unaffected. Rebuild the variant database before rerunning — `database create` snapshots
+> the source.
 
 The vuln-minus-fixed difference is the result: patch `8d7970b8` touches only `eap.c`, and
 only the `eap.c` findings disappear. No query edits between the two runs.
@@ -177,7 +188,7 @@ Prediction was recorded before the run: 2 / 0 / 1. **It held exactly.**
 | -------- | -------- | ----- | ------ |
 | `ppp-vuln` | **2** | 4 | `eap.c:1428` and `eap.c:1854`. `chat.c` and `sendserver.c` are gone — they were unguarded copies of local data, never attacker-reachable. Precision 2/2. |
 | `ppp-fixed` | **0** | 0 | empty `#select`, empty edges and nodes. Nothing at all. |
-| variant | **1** | 2 | `tlv_server.c:78`, unchanged. |
+| variant | **1** | 2 | `tlv_server.c:78`, unchanged. Stale — see the note above; expect **2** now. |
 
 Evaluation 38.9 s / 45.6 s / 8.8 s.
 
